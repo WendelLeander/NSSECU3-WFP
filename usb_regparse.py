@@ -1,7 +1,7 @@
 r"""
 ╔══════════════════════════════════════════════════════════════════╗
-║                USB RegParse  v2.1.0                             ║
-║          Windows USB Registry Forensic Parser                   ║
+║                USB RegParse  v2.1.0                              ║
+║          Windows USB Registry Forensic Parser                    ║
 ║  Inspired by USB Detective — built for digital forensics         ║
 ╚══════════════════════════════════════════════════════════════════╝
 
