@@ -1,11 +1,11 @@
 r"""
 ╔══════════════════════════════════════════════════════════════════╗
-║                USB RegParse  v2.1.0                              ║
-║          Windows USB Registry Forensic Parser                    ║
+║                USB RegParse  v2.0.0                             ║
+║          Windows USB Registry Forensic Parser                   ║
 ║  Inspired by USB Detective — built for digital forensics         ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-WHAT'S NEW IN v2.1:
+WHAT'S NEW IN v2.0:
   - Offline Hive Parsing via python-registry (pip install python-registry)
   - EMDMgmt key parsed for Volume Name & Volume Serial Number
   - MountedDevices binary decoded (MBR disk-sig + partition offset,
@@ -241,7 +241,7 @@ def _is_admin() -> bool:
 
 
 APP_TITLE   = "USB RegParse"
-APP_VER     = "2.1.0"
+APP_VER     = "2.0.0"
 APP_SUBHEAD = "Windows USB Registry Forensic Parser"
 
 # Dark forensics colour scheme
@@ -265,14 +265,16 @@ FONT_TITLE = ("Segoe UI", 20, "bold")
 FONT_SMALL = ("Segoe UI", 9)
 
 # Registry path constants
-REG_USBSTOR    = r"SYSTEM\CurrentControlSet\Enum\USBSTOR"
-REG_USB        = r"SYSTEM\CurrentControlSet\Enum\USB"
-REG_EMDMGMT    = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\EMDMgmt"
-REG_MOUNTED    = r"SYSTEM\MountedDevices"
-REG_MNTPNT     = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2"
-REG_DEVCLASSES = r"SYSTEM\CurrentControlSet\Control\DeviceClasses"
-REG_WPD        = r"SOFTWARE\Microsoft\Windows Portable Devices\Devices"
-REG_VOLCACHE   = r"SOFTWARE\Microsoft\Windows Search\VolumeInfoCache"
+REG_USBSTOR     = r"SYSTEM\CurrentControlSet\Enum\USBSTOR"
+REG_USB         = r"SYSTEM\CurrentControlSet\Enum\USB"
+REG_EMDMGMT     = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\EMDMgmt"
+REG_MOUNTED     = r"SYSTEM\MountedDevices"
+REG_MNTPNT      = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2"
+REG_DEVCLASSES  = r"SYSTEM\CurrentControlSet\Control\DeviceClasses"
+REG_WPD         = r"SOFTWARE\Microsoft\Windows Portable Devices\Devices"
+REG_VOLCACHE    = r"SOFTWARE\Microsoft\Windows Search\VolumeInfoCache"
+# Maps every local SID → profile folder path  (e.g. C:\Users\Alice)
+REG_PROFILELIST = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
 
 # Device Properties GUID for timestamps (DEVPKEY_Device_InstallDate family)
 PROP_GUID           = "{83da6326-97a6-4088-9453-a1923f573b29}"
@@ -523,6 +525,151 @@ class HiveKey:
         self.close()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  SID → USERNAME HELPERS  (live mode only)
+#
+#  For live scanning we enumerate HKEY_USERS which holds every loaded user
+#  hive as a SID subkey (e.g. S-1-5-21-...-1001).  We translate each SID
+#  to a human-readable username using two methods:
+#    1. ProfileList in HKLM\SOFTWARE — maps SID → profile folder path
+#       (e.g. C:\Users\Alice).  The username is the last path component.
+#    2. Win32 LookupAccountSid (ctypes) — asks the OS directly.
+#  Both are attempted; whichever returns a non-empty string wins.
+#  Service / built-in SIDs (those without a profile folder under C:\Users)
+#  are skipped so they don't pollute the Users column.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _sid_to_username(sid_str: str) -> str:
+    """
+    Translate a SID string (e.g. 'S-1-5-21-...-1001') to a Windows username.
+
+    Strategy 1 — ProfileList registry key (no DLL required):
+        HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\<SID>
+        ProfileImagePath = C:\\Users\\<username>
+        The folder name is the username.
+
+    Strategy 2 — Win32 LookupAccountSidW (ctypes fallback):
+        Calls advapi32.LookupAccountSidW to let Windows resolve the SID.
+
+    Returns the username string, or '' if the SID cannot be resolved or
+    belongs to a system / service account (no real user profile folder).
+    """
+    # ── Strategy 1: ProfileList ──────────────────────────────────────────
+    if sys.platform == "win32" and winreg:
+        try:
+            key_path = f"{REG_PROFILELIST}\\{sid_str}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as k:
+                profile_path, _ = winreg.QueryValueEx(k, "ProfileImagePath")
+            if profile_path:
+                # Expand %SystemDrive% / %SystemRoot% style variables
+                profile_path = os.path.expandvars(profile_path)
+                username = Path(profile_path).name
+                # Skip well-known non-human accounts
+                if username.upper() not in (
+                        "SYSTEMPROFILE", "LOCALSERVICE", "NETWORKSERVICE",
+                        "DEFAULT", "PUBLIC", "ALL USERS", "DEFAULT USER"):
+                    return username
+        except OSError:
+            pass
+
+    # ── Strategy 2: LookupAccountSidW ───────────────────────────────────
+    if sys.platform == "win32":
+        try:
+            import ctypes.wintypes as _w
+
+            # Convert SID string to binary SID via ConvertStringSidToSidW
+            _advapi = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore
+            sid_ptr  = ctypes.c_void_p()
+            if not _advapi.ConvertStringSidToSidW(sid_str, ctypes.byref(sid_ptr)):
+                return ""
+
+            name_buf  = ctypes.create_unicode_buffer(256)
+            name_size = _w.DWORD(256)
+            dom_buf   = ctypes.create_unicode_buffer(256)
+            dom_size  = _w.DWORD(256)
+            sid_use   = _w.DWORD()
+
+            ok = _advapi.LookupAccountSidW(
+                None, sid_ptr,
+                name_buf, ctypes.byref(name_size),
+                dom_buf,  ctypes.byref(dom_size),
+                ctypes.byref(sid_use))
+
+            _advapi.LocalFree(sid_ptr)
+
+            if ok and name_buf.value:
+                return name_buf.value
+        except Exception:
+            pass
+
+    return ""
+
+
+def _enum_hkey_users_mountpoints(
+        mounted: dict[str, "MountedEntry"]) -> list[tuple["HiveKey", str]]:
+    """
+    Live-mode replacement for iterating HKEY_CURRENT_USER only.
+
+    Enumerates every SID subkey in HKEY_USERS, translates the SID to a
+    username, opens that SID's MountPoints2 key, and returns the result as
+    a list of (HiveKey, username) pairs — identical to what get_all_users_cu
+    returns for offline mode.
+
+    HKEY_USERS contains:
+      .DEFAULT                     ← default profile, skip
+      S-1-5-18 / S-1-5-19 / etc.  ← SYSTEM / LocalService, skip
+      S-1-5-21-...-<RID>           ← real user hives (RID ≥ 1000)
+      S-1-5-21-...-<RID>_Classes   ← class registrations, skip
+    """
+    if sys.platform != "win32" or not winreg:
+        return []
+
+    result: list[tuple[HiveKey, str]] = []
+
+    try:
+        hku = winreg.OpenKey(winreg.HKEY_USERS, "")
+    except OSError:
+        return result
+
+    idx = 0
+    while True:
+        try:
+            sid_str = winreg.EnumKey(hku, idx)
+            idx += 1
+        except OSError:
+            break
+
+        # Skip built-in / service accounts and the _Classes suffix keys
+        if (not sid_str.startswith("S-1-5-21-") or
+                sid_str.endswith("_Classes")):
+            continue
+
+        # Only include real user accounts (RID ≥ 1000 is the convention
+        # for local users created during setup or by administrators)
+        try:
+            rid = int(sid_str.rsplit("-", 1)[-1])
+            if rid < 1000:
+                continue
+        except ValueError:
+            continue
+
+        # Translate SID to username
+        username = _sid_to_username(sid_str)
+        if not username:
+            username = sid_str   # fall back to raw SID if resolution fails
+
+        # Open MountPoints2 for this SID
+        mp2_path = f"{sid_str}\\{REG_MNTPNT}"
+        try:
+            h = winreg.OpenKey(winreg.HKEY_USERS, mp2_path)
+            result.append((HiveKey(h, live=True, key_name="MountPoints2"), username))
+        except OSError:
+            pass   # user has no MountPoints2 key — no USB history for them
+
+    winreg.CloseKey(hku)
+    return result
+
+
 class RegistryContext:
     """
     Provides open_lm() / open_cu() / get_all_users_cu() for both scan modes.
@@ -639,26 +786,77 @@ class RegistryContext:
 
     def get_all_users_cu(self, path: str) -> list[tuple[HiveKey, str]]:
         """
-        Open a HKCU path across ALL users.
-        Live mode   → current user only.
-        Offline mode → all loaded NTUSER.DAT files.
+        Open a HKCU-rooted path across ALL users.
+
+        Live mode:
+            Enumerates every user SID in HKEY_USERS (all loaded user hives),
+            translates each SID to a username via ProfileList / LookupAccountSid,
+            and opens path under each SID.  This covers every user account that
+            has logged in since the last reboot — not just the current user.
+
+            The old approach of opening HKEY_CURRENT_USER only returned the
+            user running the script, missing every other account's USB history.
+
+        Offline mode:
+            Iterates all loaded NTUSER.DAT files (provided at startup).
+            Each file is paired with the username entered in the hive loader
+            (auto-detected from the file path when browsed via the GUI).
+
         Returns list of (HiveKey, username) pairs.
         """
         if self.live:
-            try:
-                h = winreg.OpenKey(winreg.HKEY_CURRENT_USER, path)
-                user = os.environ.get("USERNAME", "Current User")
-                return [(HiveKey(h, True, path.split("\\")[-1]), user)]
-            except OSError:
-                return []
+            # Use HKEY_USERS enumeration to cover ALL users, not just the
+            # current process owner.  _enum_hkey_users_mountpoints opens the
+            # MountPoints2 key directly for each SID, so we strip the path
+            # prefix here and let the caller use the returned HiveKey as-is.
+            if path == REG_MNTPNT:
+                # Fast path: MountPoints2 is opened inside the enumerator
+                # to avoid the need for a second winreg.OpenKey per SID.
+                return _enum_hkey_users_mountpoints({})
+            else:
+                # Generic path: open <SID>\<path> for each active user SID
+                if not winreg:
+                    return []
+                result: list[tuple[HiveKey, str]] = []
+                try:
+                    hku = winreg.OpenKey(winreg.HKEY_USERS, "")
+                    idx = 0
+                    while True:
+                        try:
+                            sid_str = winreg.EnumKey(hku, idx)
+                            idx += 1
+                        except OSError:
+                            break
+                        if (not sid_str.startswith("S-1-5-21-") or
+                                sid_str.endswith("_Classes")):
+                            continue
+                        try:
+                            rid = int(sid_str.rsplit("-", 1)[-1])
+                            if rid < 1000:
+                                continue
+                        except ValueError:
+                            continue
+                        username = _sid_to_username(sid_str) or sid_str
+                        try:
+                            h = winreg.OpenKey(winreg.HKEY_USERS,
+                                               f"{sid_str}\\{path}")
+                            result.append((HiveKey(h, True,
+                                           path.split("\\")[-1]), username))
+                        except OSError:
+                            pass
+                    winreg.CloseKey(hku)
+                except OSError:
+                    pass
+                return result
 
-        result = []
+        # ── Offline: iterate all loaded NTUSER.DAT files ──────────────────
+        result_off: list[tuple[HiveKey, str]] = []
         for reg, username in self._ntusers:
             try:
-                result.append((HiveKey(reg.open(path), False), username))
+                result_off.append((HiveKey(reg.open(path), False), username))
             except Exception:
                 pass
-        return result
+        return result_off
 
     def get_current_username(self) -> str:
         if self.live:
@@ -1127,10 +1325,18 @@ def _try_decode_device_path(data: bytes) -> str:
       _??_USBSTOR#Disk&Ven_SanDisk&Prod_Ultra&Rev_1.00#4C531001&0#{53f56307-...}
       \\??\\USBSTOR#Disk&...
 
-    These are encoded as UTF-16-LE (2 bytes per char).  The MBR-style 12-byte
-    entries cannot be valid UTF-16-LE text, so detecting the prefix is reliable.
+    These are encoded as UTF-16-LE (2 bytes per char).
 
-    Returns the decoded string or "" if the data is not a device path.
+    IMPORTANT — null-byte cleaning:
+      After UTF-16-LE decode, embedded \\x00 characters may remain
+      (e.g. from padding or alignment bytes within the binary blob).
+      rstrip("\\x00") only removes trailing nulls, leaving embedded ones
+      that silently break every subsequent string comparison.
+      We use .replace("\\x00", "") to remove ALL null characters, then
+      .lower() so that case differences between the MountedDevices path
+      and the USBSTOR ParentIdPrefix never cause a missed match.
+
+    Returns the fully cleaned, lowercased string, or "" if not a device path.
     """
     if len(data) < 8:
         return ""
@@ -1143,7 +1349,9 @@ def _try_decode_device_path(data: bytes) -> str:
     if not any(data.startswith(p) for p in prefixes_utf16):
         return ""
     try:
-        decoded = data.decode("utf-16-le").rstrip("\x00")
+        decoded = data.decode("utf-16-le")
+        # Strip ALL null bytes (not just trailing) then lowercase for safe matching
+        decoded = decoded.replace("\x00", "").lower()
         return decoded
     except (UnicodeDecodeError, ValueError):
         return ""
@@ -1187,12 +1395,13 @@ def parse_mounted_devices(ctx: RegistryContext) -> dict[str, MountedEntry]:
 
         if dev_path:
             # ── Format 3: UTF-16-LE device path (ParentIdPrefix style) ────
+            # dev_path is already lowercased + null-stripped by _try_decode_device_path
             entry.device_path = dev_path
             # Extract the serial / ParentIdPrefix from the path.
-            # Pattern: #<serial>&0# (same regex as DeviceClasses parser)
+            # Store lowercased so all comparisons use the same case.
             ser_m = re.search(r"#([^#&]{4,})&0#", dev_path, re.IGNORECASE)
             if ser_m:
-                entry.parent_id_prefix = ser_m.group(1)
+                entry.parent_id_prefix = ser_m.group(1).lower()
             # Also extract any embedded GUID from the path
             guid_m = re.search(r"\{[0-9a-f-]{36}\}", dev_path, re.IGNORECASE)
             if guid_m:
@@ -1636,8 +1845,9 @@ def enrich_devices(
                 vol_guid_to_letter[e.volume_guid.upper()] = e.drive_letter
             if e.disk_sig:
                 sig_to_letter[e.disk_sig.upper()] = e.drive_letter
-            if e.parent_id_prefix:                             # ← NEW
-                parent_id_to_letter[e.parent_id_prefix.upper()] = e.drive_letter
+            if e.parent_id_prefix:
+                # parent_id_prefix is stored lowercase (normalised during decode)
+                parent_id_to_letter[e.parent_id_prefix.lower()] = e.drive_letter
 
     # vol_guid → [username]
     vol_guid_to_users: dict[str, list[str]] = {}
@@ -1666,14 +1876,15 @@ def enrich_devices(
         # This is the most important path for removable flash drives.
         # The ParentIdPrefix stored in USBSTOR is compared against the
         # serial / ParentIdPrefix decoded from MountedDevices binary data.
+        # Both sides must use the same case — we normalise to lowercase.
         if not dev.drive_letter and dev.parent_id_prefix:
             dev.drive_letter = parent_id_to_letter.get(
-                dev.parent_id_prefix.upper(), "")
+                dev.parent_id_prefix.lower(), "")
 
         # Also try the full serial (some drives use serial directly)
         if not dev.drive_letter and dev.serial_number:
             dev.drive_letter = parent_id_to_letter.get(
-                dev.serial_number.upper(), "")
+                dev.serial_number.lower(), "")
 
         # ── Volume label: WPD (serial-indexed, most direct) ──────────────
         # Try this FIRST before EMDMgmt because WPD stores the actual
@@ -2472,7 +2683,7 @@ class USBRegParseApp(tk.Tk):
                 "To get complete results:\n"
                 "  1. Close this window\n"
                 "  2. Right-click usb_regparse.py → Run as Administrator\n"
-                "     (or launch your terminal/IDE as Administrator first)\n\n"
+                "     (or launch your terminal as Administrator first)\n\n"
                 "You may continue, but timestamp fields will be incomplete.",
                 parent=self)
 
@@ -2555,6 +2766,35 @@ class USBRegParseApp(tk.Tk):
                 parent=self)
             if not proceed:
                 return
+
+        # ── NTUSER.DAT missing warning ───────────────────────────────────
+        # Without NTUSER.DAT the Users column will be blank for every device.
+        # Warn the user and offer to browse for one before proceeding.
+        if not ntuser_list:
+            add_now = messagebox.askyesno(
+                "NTUSER.DAT Not Loaded — User Attribution Will Be Blank",
+                "No NTUSER.DAT file has been loaded.\n\n"
+                "The 'Users' column shows which Windows account accessed\n"
+                "each USB drive.  Without NTUSER.DAT this column will be\n"
+                "blank for every device.\n\n"
+                "To add user attribution:\n"
+                "  • Copy  C:\\Users\\<username>\\NTUSER.DAT  from the\n"
+                "    source machine (one file per user account).\n"
+                "  • Browse for it in the NTUSER.DAT row in the hive panel.\n"
+                "    The username is auto-detected from the file path.\n\n"
+                "Would you like to browse for an NTUSER.DAT file now?\n"
+                "(Select 'No' to continue the scan without user attribution.)",
+                icon="warning",
+                parent=self)
+            if add_now:
+                # Add a row (if needed) then open the browse dialog immediately
+                self._add_ntuser_row()
+                pv, uv = self._ntuser_entries[-1]
+                self._browse_ntuser(pv, uv)
+                # Re-collect in case the user filled in a path
+                ntuser_list = [(pv2.get().strip(), uv2.get().strip())
+                               for pv2, uv2 in self._ntuser_entries
+                               if pv2.get().strip()]
 
         self._pre_scan()
         def _run():
