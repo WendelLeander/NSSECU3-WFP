@@ -1,11 +1,11 @@
 r"""
 ╔══════════════════════════════════════════════════════════════════╗
-║                USB RegParse  v2.0.0                             ║
+║                USB RegParse  v2.1.0                             ║
 ║          Windows USB Registry Forensic Parser                   ║
 ║  Inspired by USB Detective — built for digital forensics         ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-WHAT'S NEW IN v2.0:
+WHAT'S NEW IN v2.1:
   - Offline Hive Parsing via python-registry (pip install python-registry)
   - EMDMgmt key parsed for Volume Name & Volume Serial Number
   - MountedDevices binary decoded (MBR disk-sig + partition offset,
@@ -241,7 +241,7 @@ def _is_admin() -> bool:
 
 
 APP_TITLE   = "USB RegParse"
-APP_VER     = "2.0.0"
+APP_VER     = "2.1.0"
 APP_SUBHEAD = "Windows USB Registry Forensic Parser"
 
 # Dark forensics colour scheme
