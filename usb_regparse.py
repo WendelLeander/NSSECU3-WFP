@@ -38,6 +38,8 @@ import re
 import csv
 import json
 import struct
+import ctypes
+import ctypes.wintypes
 import threading
 import traceback
 import tkinter as tk
@@ -63,8 +65,180 @@ except ImportError:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  APP CONSTANTS & COLOUR PALETTE
+#  PRIVILEGE ELEVATION  — SeBackupPrivilege
+#
+#  The USBSTOR Properties subkeys (which hold the DEVPKEY timestamps) have
+#  an ACL that grants READ only to NT AUTHORITY\SYSTEM, not Administrators.
+#  Even running as Administrator, winreg.OpenKey() returns "Access Denied"
+#  (OSError 5) when navigating into Properties\{GUID}\0064 etc.
+#
+#  The fix is two-part:
+#    1. Enable SeBackupPrivilege in the current process token.
+#       Administrators possess this privilege but it is disabled by default.
+#    2. Open every registry key with REG_OPTION_BACKUP_RESTORE (0x4) passed
+#       as the `reserved` / ulOptions parameter to RegOpenKeyEx.
+#       This flag tells Windows to bypass the ACL check and use the backup
+#       privilege instead — exactly how tools like Registry Explorer do it.
 # ════════════════════════════════════════════════════════════════════════════
+
+# ulOptions flag that bypasses ACL checks when SeBackupPrivilege is active
+REG_OPTION_BACKUP_RESTORE: int = 0x00000004
+
+# Module-level flag: True once the privilege has been successfully enabled
+_backup_priv_enabled: bool = False
+
+
+def enable_backup_privilege() -> bool:
+    """
+    Enable SeBackupPrivilege for the current process token so that
+    winreg.OpenKey() with REG_OPTION_BACKUP_RESTORE can read keys
+    protected by SYSTEM-only ACLs (e.g. USBSTOR Properties timestamps).
+
+    ── WHY THE PREVIOUS IMPLEMENTATION FAILED ──────────────────────────
+    Using `ctypes.windll.advapi32` without declaring `argtypes` and
+    `restype` is silently broken on 64-bit Windows.  ctypes defaults to
+    treating every parameter as a 32-bit `c_int`.  HANDLE is 8 bytes on
+    64-bit Windows, so the handle returned by GetCurrentProcess() was
+    truncated to 4 bytes before being passed to OpenProcessToken.
+    OpenProcessToken received garbage, failed, and returned False —
+    which our `if not advapi32.OpenProcessToken(...)` branch caught and
+    returned False from, never reaching AdjustTokenPrivileges at all.
+
+    ── THE FIX ──────────────────────────────────────────────────────────
+    Use `ctypes.WinDLL("advapi32", use_last_error=True)` and explicitly
+    declare `.argtypes` and `.restype` for every function.  This forces
+    ctypes to marshal 64-bit HANDLEs correctly on both 32- and 64-bit
+    Windows.  `use_last_error=True` also makes `ctypes.get_last_error()`
+    (thread-local) reliable instead of the shared `ctypes.GetLastError()`.
+    """
+    global _backup_priv_enabled
+    if _backup_priv_enabled:
+        return True
+    if sys.platform != "win32":
+        return False
+
+    import ctypes.wintypes as w
+
+    # ── Win32 constants ──────────────────────────────────────────────────
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_QUERY             = 0x0008
+    SE_PRIVILEGE_ENABLED    = 0x00000002
+
+    # ── C structures ────────────────────────────────────────────────────
+    class _LUID(ctypes.Structure):
+        _fields_ = [("LowPart", w.DWORD), ("HighPart", w.LONG)]
+
+    class _LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", _LUID), ("Attributes", w.DWORD)]
+
+    class _TOKEN_PRIVILEGES(ctypes.Structure):
+        # Privileges is an array of 1 element (we only need one privilege)
+        _fields_ = [("PrivilegeCount", w.DWORD),
+                    ("Privileges",     _LUID_AND_ATTRIBUTES * 1)]
+
+    try:
+        # Load DLLs with use_last_error=True so get_last_error() is reliable
+        _advapi = ctypes.WinDLL("advapi32", use_last_error=True)   # type: ignore
+        _kernel = ctypes.WinDLL("kernel32", use_last_error=True)   # type: ignore
+
+        # ── Declare argtypes + restype for every function we call ────────
+        # Without this ctypes truncates 64-bit HANDLEs to 32 bits, silently
+        # passing garbage pointers and causing every call to fail.
+
+        _kernel.GetCurrentProcess.restype  = w.HANDLE
+        _kernel.GetCurrentProcess.argtypes = []
+
+        _kernel.CloseHandle.restype  = w.BOOL
+        _kernel.CloseHandle.argtypes = [w.HANDLE]
+
+        _advapi.OpenProcessToken.restype  = w.BOOL
+        _advapi.OpenProcessToken.argtypes = [
+            w.HANDLE,                    # ProcessHandle
+            w.DWORD,                     # DesiredAccess
+            ctypes.POINTER(w.HANDLE),    # TokenHandle (out)
+        ]
+
+        _advapi.LookupPrivilegeValueW.restype  = w.BOOL
+        _advapi.LookupPrivilegeValueW.argtypes = [
+            w.LPCWSTR,                   # lpSystemName (None = local)
+            w.LPCWSTR,                   # lpName (e.g. "SeBackupPrivilege")
+            ctypes.POINTER(_LUID),       # lpLuid (out)
+        ]
+
+        _advapi.AdjustTokenPrivileges.restype  = w.BOOL
+        _advapi.AdjustTokenPrivileges.argtypes = [
+            w.HANDLE,                            # TokenHandle
+            w.BOOL,                              # DisableAllPrivileges
+            ctypes.POINTER(_TOKEN_PRIVILEGES),   # NewState
+            w.DWORD,                             # BufferLength
+            ctypes.c_void_p,                     # PreviousState (optional, NULL)
+            ctypes.c_void_p,                     # ReturnLength  (optional, NULL)
+        ]
+
+        # ── Step 1: open process token ───────────────────────────────────
+        h_token = w.HANDLE()
+        ok = _advapi.OpenProcessToken(
+            _kernel.GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            ctypes.byref(h_token))
+        if not ok:
+            return False
+
+        # ── Step 2: resolve the LUID for SeBackupPrivilege ───────────────
+        luid = _LUID()
+        ok = _advapi.LookupPrivilegeValueW(None, "SeBackupPrivilege",
+                                           ctypes.byref(luid))
+        if not ok:
+            _kernel.CloseHandle(h_token)
+            return False
+
+        # ── Step 3: build TOKEN_PRIVILEGES and call AdjustTokenPrivileges ─
+        tp = _TOKEN_PRIVILEGES()
+        tp.PrivilegeCount           = 1
+        tp.Privileges[0].Luid       = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+        _advapi.AdjustTokenPrivileges(
+            h_token,
+            w.BOOL(False),
+            ctypes.byref(tp),
+            ctypes.sizeof(tp),
+            None,   # don't need previous state
+            None)
+
+        _kernel.CloseHandle(h_token)
+
+        # AdjustTokenPrivileges returns TRUE even on partial failure;
+        # check the thread-local last-error set by WinDLL(use_last_error=True).
+        # ERROR_SUCCESS (0)               → all privileges assigned ✓
+        # ERROR_NOT_ALL_ASSIGNED (1300)   → process lacks the privilege
+        err = ctypes.get_last_error()
+        if err == 0:
+            _backup_priv_enabled = True
+            return True
+        return False
+
+    except Exception:
+        return False
+
+
+def _is_admin() -> bool:
+    """
+    Return True if the current process is running with Administrator privileges.
+    Uses the Windows IsUserAnAdmin() shell API, which checks whether the process
+    token contains the Administrators group SID with the SE_GROUP_ENABLED flag.
+    Falls back to ctypes.windll.shell32.IsUserAnAdmin() on older Python builds.
+    Returns False on non-Windows platforms.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore
+    except Exception:
+        return False
+
+
+
 
 APP_TITLE   = "USB RegParse"
 APP_VER     = "2.0.0"
@@ -97,6 +271,8 @@ REG_EMDMGMT    = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\EMDMgmt"
 REG_MOUNTED    = r"SYSTEM\MountedDevices"
 REG_MNTPNT     = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2"
 REG_DEVCLASSES = r"SYSTEM\CurrentControlSet\Control\DeviceClasses"
+REG_WPD        = r"SOFTWARE\Microsoft\Windows Portable Devices\Devices"
+REG_VOLCACHE   = r"SOFTWARE\Microsoft\Windows Search\VolumeInfoCache"
 
 # Device Properties GUID for timestamps (DEVPKEY_Device_InstallDate family)
 PROP_GUID           = "{83da6326-97a6-4088-9453-a1923f573b29}"
@@ -214,17 +390,36 @@ class HiveKey:
         """
         Open a descendant key by backslash-separated path.
         Raises OSError if any component is missing.
+
+        Live mode: if the first attempt is denied (OSError 5 — Access Denied),
+        automatically retries with REG_OPTION_BACKUP_RESTORE so that keys
+        protected by NT AUTHORITY\\SYSTEM ACLs (e.g. USBSTOR Properties
+        timestamp subkeys) are readable when SeBackupPrivilege is active.
         """
         if self._live:
-            h = winreg.OpenKey(self._h, path)
+            try:
+                h = winreg.OpenKey(self._h, path)
+            except PermissionError:
+                # Access denied — retry with backup/restore semantics which
+                # bypasses the ACL check.  Requires SeBackupPrivilege to be
+                # enabled in the process token (see enable_backup_privilege()).
+                h = winreg.OpenKey(
+                    self._h, path,
+                    REG_OPTION_BACKUP_RESTORE,      # ulOptions = bypass ACL
+                    winreg.KEY_READ)
             return HiveKey(h, True, path.split("\\")[-1])
         else:
-            # python-registry: navigate one component at a time
+            # python-registry uses .subkey(name) — case-insensitive, raises
+            # RegistryKeyNotFoundException if the key is missing.
+            # NOTE: .find_subkey() does NOT exist in python-registry;
+            # using it caused every try_open() call to silently return None,
+            # which is why all Properties timestamp parsing failed in offline mode.
             parts = path.split("\\")
             k = self._h
             for part in parts:
-                k = k.find_subkey(part)
-                if k is None:
+                try:
+                    k = k.subkey(part)
+                except Exception:
                     raise OSError(f"Subkey not found: {part!r}")
             return HiveKey(k, False)
 
@@ -238,7 +433,18 @@ class HiveKey:
     # ── Values ────────────────────────────────────────────────────────────────
 
     def value(self, name: str, default=None):
-        """Read a single value by name.  Returns raw data or default."""
+        """
+        Read a single value by name.  Returns raw data or default.
+
+        For offline (python-registry) mode:
+          - self._h.value(name)  returns a RegistryValue *object*
+          - .value()             returns the parsed data (bytes for REG_BINARY,
+                                 datetime for RegFileTime 0x10, int for DWORD…)
+          - If python-registry parsed the type as a datetime rather than bytes
+            (which happens when the VKRecord's data_type == 0x10 RegFileTime),
+            fall back to .raw_data() which always returns the raw bytes as
+            stored on disk — exactly what _filetime_bytes_to_str() needs.
+        """
         if self._live:
             try:
                 data, _ = winreg.QueryValueEx(self._h, name)
@@ -247,7 +453,14 @@ class HiveKey:
                 return default
         else:
             try:
-                return self._h.value(name).value()
+                val_obj = self._h.value(name)   # → RegistryValue object
+                raw     = val_obj.value()        # → parsed (may be datetime/int)
+                if isinstance(raw, bytes):
+                    return raw
+                # Not bytes — python-registry interpreted the type.
+                # raw_data() always returns the uninterpreted bytes from disk.
+                raw_bytes = val_obj.raw_data()
+                return raw_bytes if isinstance(raw_bytes, bytes) else raw
             except Exception:
                 return default
 
@@ -526,25 +739,76 @@ def _filetime_to_dt(ft: int) -> datetime | None:
 
 def _filetime_bytes_to_str(data: bytes) -> str:
     """
-    Parse an 8-byte little-endian FILETIME (REG_BINARY) and return a
-    formatted UTC timestamp string, or '' on failure.
+    Parse a FILETIME stored as REG_BINARY and return a UTC timestamp string.
+
+    Windows device property values stored under the DEVPKEY subkeys are NOT
+    a bare 8-byte FILETIME.  They use a 12-byte structure:
+
+        Offset 0  : 4 bytes — property type tag (little-endian DWORD)
+                    0x10 0x00 0x00 0x00  →  VT_FILETIME (type 16 / 0x10)
+        Offset 4  : 8 bytes — actual FILETIME (100-ns intervals since 1601)
+
+    The old code unpacked from offset 0, accidentally merging the 4-byte
+    header with the first 4 bytes of the timestamp into a corrupted 64-bit
+    integer.  That produced years > 9999, causing a silent OverflowError
+    and returning a blank string.
+
+    Detection logic:
+      - If data is exactly 8 bytes  → bare FILETIME, unpack from offset 0.
+      - If data is ≥ 12 bytes AND the first DWORD is 0x10 (VT_FILETIME)
+        → structured form, skip the 4-byte header, unpack from offset 4.
+      - Any other length / header → attempt offset 0 as a last resort.
     """
-    if not isinstance(data, bytes) or len(data) < 8:
+    if not isinstance(data, bytes):
         return ""
-    ft = struct.unpack_from("<Q", data, 0)[0]
+
+    # ── Determine where the 8-byte FILETIME actually starts ──────────────
+    offset = 0
+    if len(data) >= 12:
+        header = struct.unpack_from("<I", data, 0)[0]
+        if header == 0x10:          # VT_FILETIME — skip the 4-byte header
+            offset = 4
+    elif len(data) < 8:
+        return ""                   # not enough bytes regardless
+
+    if len(data) < offset + 8:
+        return ""
+
+    ft = struct.unpack_from("<Q", data, offset)[0]
     dt = _filetime_to_dt(ft)
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else ""
 
 
 def _read_devpkey_timestamps(inst_key: HiveKey) -> dict[str, str]:
     """
-    Read the four DEVPKEY timestamp values stored under:
+    Read DEVPKEY timestamps from:
       <instance_key>\\Properties\\{83da6326-97a6-4088-9453-a1923f573b29}
 
-    Returns a dict with keys:
-      "first_connected"   ← value 0064
-      "last_connected"    ← value 0066
-      "last_disconnected" ← value 0067
+    The 0064 / 0066 / 0067 entries are SUBKEYS, each containing a binary
+    value whose bytes encode the FILETIME.  The structure varies by Windows
+    version:
+
+      Win10/11 (8-digit zero-padded):
+        {GUID}\\00000064\\00000000  →  value "Data" (or unnamed)  →  12-byte blob
+        {GUID}\\00000066\\00000000  →  value "Data" (or unnamed)  →  12-byte blob
+        {GUID}\\00000067\\00000000  →  value "Data" (or unnamed)  →  12-byte blob
+
+      Win8 / older (4-digit):
+        {GUID}\\0064  →  unnamed (default) value  →  12-byte blob
+        {GUID}\\0066  →  unnamed (default) value  →  12-byte blob
+        {GUID}\\0067  →  unnamed (default) value  →  12-byte blob
+
+    The 12-byte blob format:
+        Bytes 0-3   : DEVPROPTYPE tag  (0x10 0x00 0x00 0x00 = VT_FILETIME)
+        Bytes 4-11  : FILETIME         (100-ns intervals since 1601-01-01 UTC)
+
+    _filetime_bytes_to_str() handles both the bare 8-byte and the 12-byte
+    header form by detecting the 0x10 prefix and skipping it.
+
+    Returns:
+      "first_connected"    ← 00000064 / 0064  (First Install Date)
+      "last_connected"     ← 00000066 / 0066  (Last Arrival Date)
+      "last_disconnected"  ← 00000067 / 0067  (Last Removal Date)
     """
     result: dict[str, str] = {}
     prop_root = inst_key.try_open("Properties")
@@ -555,17 +819,76 @@ def _read_devpkey_timestamps(inst_key: HiveKey) -> dict[str, str]:
         prop_root.close()
         return result
 
-    mapping = {
-        PROP_FIRST_INSTALL: "first_connected",
-        PROP_LAST_ARRIVAL:  "last_connected",
-        PROP_LAST_REMOVAL:  "last_disconnected",
-    }
-    for val_id, field_name in mapping.items():
-        raw = guid_key.value(val_id)
-        if isinstance(raw, bytes):
-            ts = _filetime_bytes_to_str(raw)
-            if ts:
-                result[field_name] = ts
+    def _get_ts_from_prop(short_id: str, long_id: str) -> str:
+        """
+        Try Win10/11 8-digit path first, then Win8 4-digit path.
+        Reads the binary FILETIME bytes from the Data / (default) value
+        and passes them to _filetime_bytes_to_str() for decoding.
+
+        Value name variants tried (both named and unnamed/default):
+          Win10/11: {GUID}\\<long_id>\\00000000 → "Data" then "(default)"
+          Win8:     {GUID}\\<short_id>           → "(default)" then "Data"
+
+        NOTE: python-registry maps the query name "(default)" → "" internally
+        so it finds unnamed VKRecords.  Passing "" directly also works for
+        unnamed values, but "(default)" is the canonical form and more robust
+        across python-registry versions.
+        """
+
+        def _read_bytes_from_key(key: HiveKey) -> bytes | None:
+            """
+            Try all known value names for a DEVPKEY property key and return
+            the raw bytes, or None if nothing useful is found.
+            """
+            # Try "Data" (Win10/11 named value) first
+            for vname in ("Data", "(default)", ""):
+                candidate = key.value(vname)
+                if isinstance(candidate, bytes) and len(candidate) >= 8:
+                    return candidate
+            return None
+
+        # ── Win10/11: {GUID}\\<long_id>\\00000000 ────────────────────────
+        outer = guid_key.try_open(long_id)
+        if outer is not None:
+            inner = outer.try_open("00000000")
+            if inner is not None:
+                raw = _read_bytes_from_key(inner)
+                inner.close()
+                if raw:
+                    ts = _filetime_bytes_to_str(raw)
+                    outer.close()
+                    if ts:
+                        return ts
+            # Some builds store it directly on the outer key
+            raw = _read_bytes_from_key(outer)
+            outer.close()
+            if raw:
+                ts = _filetime_bytes_to_str(raw)
+                if ts:
+                    return ts
+
+        # ── Win8 / older: {GUID}\\<short_id> ─────────────────────────────
+        sk = guid_key.try_open(short_id)
+        if sk is not None:
+            raw = _read_bytes_from_key(sk)
+            sk.close()
+            if raw:
+                ts = _filetime_bytes_to_str(raw)
+                if ts:
+                    return ts
+
+        return ""
+
+    # Map: field_name → (4-digit-id, 8-digit-id)
+    checks = [
+        ("first_connected",   PROP_FIRST_INSTALL, f"0000{PROP_FIRST_INSTALL}"),
+        ("last_connected",    PROP_LAST_ARRIVAL,  f"0000{PROP_LAST_ARRIVAL}"),
+        ("last_disconnected", PROP_LAST_REMOVAL,  f"0000{PROP_LAST_REMOVAL}"),
+    ]
+    for field_name, short_id, long_id in checks:
+        ts = _get_ts_from_prop(short_id, long_id)
+        if ts:
+            result[field_name] = ts
 
     guid_key.close()
     prop_root.close()
@@ -671,28 +994,109 @@ def parse_emdmgmt(ctx: RegistryContext) -> dict[str, EMDEntry]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  WINDOWS PORTABLE DEVICES PARSER  — User-assigned Volume Labels
+#
+#  SOFTWARE\Microsoft\Windows Portable Devices\Devices
+#  Subkey names encode the full USBSTOR device path (with # separators).
+#  The FriendlyName value is the volume label the user or Windows assigned.
+#  This source survives drive re-plugs and often holds the label even when
+#  EMDMgmt does not.
+# ════════════════════════════════════════════════════════════════════════════
+
+def parse_wpd_devices(ctx: RegistryContext) -> dict[str, str]:
+    """
+    Parse SOFTWARE\\Microsoft\\Windows Portable Devices\\Devices.
+
+    Subkey name example:
+      SWD#WPDBUSENUM#_??_USBSTOR#Disk&Ven_SanDisk&Prod_Ultra&Rev_1.00#4C531001&0#{...}
+
+    Returns { UPPERCASE_SERIAL : "FriendlyName / volume label" }
+    """
+    result: dict[str, str] = {}
+    key = ctx.try_open_lm(REG_WPD)
+    if key is None:
+        return result
+
+    for subkey in key.subkeys():
+        fn = subkey.value("FriendlyName")
+        if not fn or not isinstance(fn, str) or not fn.strip():
+            subkey.close()
+            continue
+
+        # Extract serial number from the subkey name.
+        # Pattern: #<serial>&0# where serial is the USBSTOR instance key name.
+        ser_m = re.search(r"#([^#&]{4,})&0#", subkey.name, re.IGNORECASE)
+        if ser_m:
+            result[ser_m.group(1).upper()] = fn.strip()
+
+        subkey.close()
+
+    key.close()
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  VOLUME INFO CACHE PARSER  — Windows Search Volume Labels
+#
+#  SOFTWARE\Microsoft\Windows Search\VolumeInfoCache
+#  Subkey names are drive letters (e.g. "E:\").  The VolumeLabel value is the
+#  filesystem label — exactly what Windows Explorer shows for the drive.
+#  This is the most direct drive-letter → volume label source available.
+# ════════════════════════════════════════════════════════════════════════════
+
+def parse_volume_info_cache(ctx: RegistryContext) -> dict[str, str]:
+    """
+    Parse SOFTWARE\\Microsoft\\Windows Search\\VolumeInfoCache.
+
+    Returns { "E:" : "Volume Label" }  (drive letter uppercased, no backslash)
+    """
+    result: dict[str, str] = {}
+    key = ctx.try_open_lm(REG_VOLCACHE)
+    if key is None:
+        return result
+
+    for subkey in key.subkeys():
+        # Subkey name is "E:\" or "E:" — normalise to "E:"
+        drive = subkey.name.rstrip("\\").upper()
+        if len(drive) == 2 and drive[1] == ":":
+            label = subkey.value("VolumeLabel")
+            if label and isinstance(label, str) and label.strip():
+                result[drive] = label.strip()
+        subkey.close()
+
+    key.close()
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  MOUNTED DEVICES PARSER  — Binary Decoding & Correlation
 #
 #  MountedDevices stores two kinds of values:
 #    \DosDevices\X:          → which disk/partition is that drive letter
 #    \??\Volume{GUID}        → which disk/partition is that volume GUID
 #
-#  Binary data format:
-#    MBR-style (12 bytes): disk_signature[4LE] + partition_offset[8LE]
-#    GPT-style  (>8 bytes, starts "DMIO:ID:"): magic[8] + volume_guid[16]
+#  Binary data comes in THREE formats:
+#    MBR-style    (12 bytes): disk_sig[4LE] + partition_offset[8LE]
+#    GPT/DMIO     (24+ bytes, starts "DMIO:ID:"): volume GUID embedded
+#    DevicePath   (UTF-16-LE string): "_??_USBSTOR#..." device path string
+#                 Used by the MAJORITY of removable thumb drives.
+#                 Contains the USB serial / ParentIdPrefix in the path.
 #
-#  By comparing the binary content across both value types we can map:
-#    drive_letter ↔ volume_GUID ↔ disk_signature
+#  By comparing binary content across both value types we can map:
+#    drive_letter ↔ volume_GUID ↔ disk_signature ↔ parent_id_prefix
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class MountedEntry:
-    raw_name:        str         # original registry value name
-    disk_sig:        str         # 8-char hex MBR signature, or ""
-    partition_offset:int         # MBR partition byte offset, or 0
-    volume_guid:     str         # "{xxxxxxxx-...}" if DMIO/GPT, or ""
-    drive_letter:    str         # "E:" if from \DosDevices\X:, else ""
-    raw_hex:         str         # full binary as hex (for display/debug)
+    raw_name:         str   # original registry value name
+    disk_sig:         str   # 8-char hex MBR signature, or ""
+    partition_offset: int   # MBR partition byte offset, or 0
+    volume_guid:      str   # "{xxxxxxxx-...}" if DMIO/GPT, or ""
+    drive_letter:     str   # "E:" if from \DosDevices\X:, else ""
+    raw_hex:          str   # full binary as hex (for display/debug)
+    # ParentIdPrefix-style entries (UTF-16-LE device path in the binary data)
+    parent_id_prefix: str   # extracted USB serial / ParentIdPrefix, or ""
+    device_path:      str   # full decoded device path string, or ""
 
 
 def _parse_dmio_guid(data: bytes) -> str:
@@ -714,12 +1118,50 @@ def _parse_dmio_guid(data: bytes) -> str:
         return ""
 
 
+def _try_decode_device_path(data: bytes) -> str:
+    """
+    Detect and decode a MountedDevices binary value that is actually a
+    UTF-16-LE encoded device path string (ParentIdPrefix style).
+
+    Windows stores removable drive entries as strings like:
+      _??_USBSTOR#Disk&Ven_SanDisk&Prod_Ultra&Rev_1.00#4C531001&0#{53f56307-...}
+      \\??\\USBSTOR#Disk&...
+
+    These are encoded as UTF-16-LE (2 bytes per char).  The MBR-style 12-byte
+    entries cannot be valid UTF-16-LE text, so detecting the prefix is reliable.
+
+    Returns the decoded string or "" if the data is not a device path.
+    """
+    if len(data) < 8:
+        return ""
+    # UTF-16-LE for '_??_' starts with bytes: 5f 00 3f 00 3f 00 5f 00
+    # UTF-16-LE for '\??\' starts with bytes: 5c 00 3f 00 3f 00 5c 00
+    prefixes_utf16 = (
+        b"\x5f\x00\x3f\x00\x3f\x00",   # _??
+        b"\x5c\x00\x3f\x00\x3f\x00",   # \??
+    )
+    if not any(data.startswith(p) for p in prefixes_utf16):
+        return ""
+    try:
+        decoded = data.decode("utf-16-le").rstrip("\x00")
+        return decoded
+    except (UnicodeDecodeError, ValueError):
+        return ""
+
+
 def parse_mounted_devices(ctx: RegistryContext) -> dict[str, MountedEntry]:
     """
     Decode every value in HKLM\\SYSTEM\\MountedDevices.
 
-    Returns { value_name : MountedEntry } — includes both \\DosDevices\\X:
-    and \\??\\Volume{GUID} entries so callers can cross-reference them.
+    Handles three binary formats:
+      1. MBR-style (12 bytes): disk_sig[4] + partition_offset[8]
+      2. GPT/DMIO (24+ bytes, "DMIO:ID:" prefix): contains volume GUID
+      3. Device-path string (UTF-16-LE): "_??_USBSTOR#..." — used by the
+         MAJORITY of removable thumb drives; contains ParentIdPrefix / serial
+
+    Returns { value_name : MountedEntry }.
+    After parsing, entries are cross-referenced so every MountedEntry with a
+    drive letter also has its binary twin annotated.
     """
     entries: dict[str, MountedEntry] = {}
     key = ctx.try_open_lm(REG_MOUNTED)
@@ -727,27 +1169,45 @@ def parse_mounted_devices(ctx: RegistryContext) -> dict[str, MountedEntry]:
         return entries
 
     for val_name, data in key.values():
-        if not isinstance(data, bytes) or len(data) < 12:
+        if not isinstance(data, bytes) or len(data) < 4:
             continue
 
         entry = MountedEntry(
             raw_name=val_name, disk_sig="", partition_offset=0,
-            volume_guid="", drive_letter="", raw_hex=data.hex().upper())
+            volume_guid="", drive_letter="", raw_hex=data.hex().upper(),
+            parent_id_prefix="", device_path="")
 
-        # Extract drive letter if this is a \DosDevices\X: value
+        # ── Extract drive letter from \DosDevices\X: value name ───────────
         m = re.match(r"\\DosDevices\\([A-Za-z]:)$", val_name)
         if m:
             entry.drive_letter = m.group(1).upper()
 
-        if data[:8] == b"DMIO:ID:":
-            # ── GPT / Dynamic Disk style ─────────────────────────────────
+        # ── Detect binary format ──────────────────────────────────────────
+        dev_path = _try_decode_device_path(data)
+
+        if dev_path:
+            # ── Format 3: UTF-16-LE device path (ParentIdPrefix style) ────
+            entry.device_path = dev_path
+            # Extract the serial / ParentIdPrefix from the path.
+            # Pattern: #<serial>&0# (same regex as DeviceClasses parser)
+            ser_m = re.search(r"#([^#&]{4,})&0#", dev_path, re.IGNORECASE)
+            if ser_m:
+                entry.parent_id_prefix = ser_m.group(1)
+            # Also extract any embedded GUID from the path
+            guid_m = re.search(r"\{[0-9a-f-]{36}\}", dev_path, re.IGNORECASE)
+            if guid_m:
+                entry.volume_guid = guid_m.group(0).upper()
+
+        elif data[:8] == b"DMIO:ID:":
+            # ── Format 2: GPT / Dynamic Disk (DMIO GUID) ──────────────────
             entry.volume_guid = _parse_dmio_guid(data)
+
         elif len(data) >= 12:
-            # ── MBR style: 4-byte disk sig + 8-byte partition offset ─────
-            entry.disk_sig        = f"{struct.unpack_from('<I', data, 0)[0]:08X}"
+            # ── Format 1: MBR-style disk signature + partition offset ──────
+            entry.disk_sig         = f"{struct.unpack_from('<I', data, 0)[0]:08X}"
             entry.partition_offset = struct.unpack_from("<Q", data, 4)[0]
 
-        # Extract GUID from \??\Volume{GUID} value names
+        # ── Extract GUID from \??\Volume{GUID} value names (any format) ───
         vm = re.search(r"\{[0-9a-f-]{36}\}", val_name, re.IGNORECASE)
         if vm and not entry.volume_guid:
             entry.volume_guid = vm.group(0).upper()
@@ -756,29 +1216,23 @@ def parse_mounted_devices(ctx: RegistryContext) -> dict[str, MountedEntry]:
 
     key.close()
 
-    # ── Build a signature → drive_letter lookup ──────────────────────────
-    # Used later so we can assign drive letters to USB devices
-    # by matching disk signatures / volume GUIDs.
-    sig_to_letter:  dict[str, str] = {}
-    guid_to_letter: dict[str, str] = {}
-
+    # ── Cross-reference: propagate drive letters via raw binary equality ──
+    # \DosDevices\X: and \??\Volume{GUID} entries for the same partition
+    # contain identical binary data.  Use this to fill in drive_letter on
+    # the Volume entries, and volume_guid on the DosDevices entries.
+    raw_to_letter:    dict[str, str] = {}
+    raw_to_vol_guid:  dict[str, str] = {}
     for e in entries.values():
         if e.drive_letter:
-            if e.disk_sig:
-                sig_to_letter[e.disk_sig] = e.drive_letter
-            if e.volume_guid:
-                guid_to_letter[e.volume_guid.upper()] = e.drive_letter
-
-    # Annotate volume-GUID entries that don't already have a drive letter
-    # by cross-referencing them with DosDevices entries sharing the same binary
-    raw_to_letter: dict[str, str] = {}
-    for e in entries.values():
-        if e.drive_letter:
-            raw_to_letter[e.raw_hex] = e.drive_letter
+            raw_to_letter[e.raw_hex]   = e.drive_letter
+        if e.volume_guid:
+            raw_to_vol_guid[e.raw_hex] = e.volume_guid
 
     for e in entries.values():
         if not e.drive_letter and e.raw_hex in raw_to_letter:
             e.drive_letter = raw_to_letter[e.raw_hex]
+        if not e.volume_guid and e.raw_hex in raw_to_vol_guid:
+            e.volume_guid = raw_to_vol_guid[e.raw_hex]
 
     return entries
 
@@ -1156,63 +1610,98 @@ def enrich_devices(
         emdmgmt:       dict[str, EMDEntry],
         mounted:       dict[str, MountedEntry],
         user_vols:     list[UserVolumeInfo],
-        serial_to_vol: dict[str, str]) -> None:
+        serial_to_vol: dict[str, str],
+        wpd_labels:    dict[str, str],
+        vol_cache:     dict[str, str]) -> None:
     """
     Populate volume_name, volume_serial, drive_letter, disk_signature,
     volume_guid and user_accounts on each device by cross-referencing
-    EMDMgmt, MountedDevices, MountPoints2, and DeviceClasses data.
+    all available sources:
+      - DeviceClasses   → serial → volume GUID
+      - MountedDevices  → GUID / disk sig / ParentIdPrefix → drive letter
+      - MountPoints2    → volume GUID → user accounts
+      - EMDMgmt         → volume serial + volume label (hardware-name based)
+      - WPD             → volume label (serial-number indexed)
+      - VolumeInfoCache → volume label (drive-letter indexed, most accurate)
     """
 
-    # ── Step 1: build quick-lookup maps ──────────────────────────────────
+    # ── Step 1: build quick-lookup maps from MountedDevices ──────────────
+    vol_guid_to_letter:    dict[str, str] = {}
+    sig_to_letter:         dict[str, str] = {}
+    parent_id_to_letter:   dict[str, str] = {}   # ← NEW: ParentIdPrefix map
 
-    # vol_serial_hex → EMDEntry
-    # (serial is already the key in emdmgmt)
-
-    # vol_guid (UPPER) → drive_letter  from mounted entries
-    vol_guid_to_letter: dict[str, str] = {}
-    sig_to_letter:      dict[str, str] = {}
     for e in mounted.values():
         if e.drive_letter:
             if e.volume_guid:
                 vol_guid_to_letter[e.volume_guid.upper()] = e.drive_letter
             if e.disk_sig:
                 sig_to_letter[e.disk_sig.upper()] = e.drive_letter
+            if e.parent_id_prefix:                             # ← NEW
+                parent_id_to_letter[e.parent_id_prefix.upper()] = e.drive_letter
 
     # vol_guid → [username]
     vol_guid_to_users: dict[str, list[str]] = {}
     for uv in user_vols:
-        key = uv.volume_guid.upper()
-        vol_guid_to_users.setdefault(key, []).append(uv.username)
+        vol_guid_to_users.setdefault(uv.volume_guid.upper(), []).append(uv.username)
 
     # ── Step 2: enrich each device ───────────────────────────────────────
     for dev in devices:
 
-        # ── Volume GUID via DeviceClasses serial mapping ─────────────────
-        # serial_to_vol maps UPPERCASE_SERIAL → volume_guid
+        # ── Volume GUID via DeviceClasses serial mapping ──────────────────
         if not dev.volume_guid and dev.serial_number:
             vol_guid = serial_to_vol.get(dev.serial_number.upper(), "")
             if not vol_guid and dev.disk_id:
                 vol_guid = serial_to_vol.get(dev.disk_id.upper(), "")
             dev.volume_guid = vol_guid
 
-        # ── Drive letter (GUID path) ──────────────────────────────────────
+        # ── Drive letter: GUID path ───────────────────────────────────────
         if not dev.drive_letter and dev.volume_guid:
-            dev.drive_letter = vol_guid_to_letter.get(
-                dev.volume_guid.upper(), "")
+            dev.drive_letter = vol_guid_to_letter.get(dev.volume_guid.upper(), "")
 
-        # ── Drive letter (disk signature path for MBR disks) ─────────────
+        # ── Drive letter: MBR disk signature ─────────────────────────────
         if not dev.drive_letter and dev.disk_signature:
             dev.drive_letter = sig_to_letter.get(dev.disk_signature.upper(), "")
 
-        # ── Volume name & serial from EMDMgmt ─────────────────────────────
-        # EMDMgmt key description = hardware friendly name (e.g. "SanDisk
-        # Ultra USB 3.0") with underscores replacing spaces.  We try three
-        # progressively looser passes so we never miss a match.
-        if not dev.volume_serial and not dev.volume_name and emdmgmt:
+        # ── Drive letter: ParentIdPrefix (thumb-drive style) ─────────────
+        # This is the most important path for removable flash drives.
+        # The ParentIdPrefix stored in USBSTOR is compared against the
+        # serial / ParentIdPrefix decoded from MountedDevices binary data.
+        if not dev.drive_letter and dev.parent_id_prefix:
+            dev.drive_letter = parent_id_to_letter.get(
+                dev.parent_id_prefix.upper(), "")
+
+        # Also try the full serial (some drives use serial directly)
+        if not dev.drive_letter and dev.serial_number:
+            dev.drive_letter = parent_id_to_letter.get(
+                dev.serial_number.upper(), "")
+
+        # ── Volume label: WPD (serial-indexed, most direct) ──────────────
+        # Try this FIRST before EMDMgmt because WPD stores the actual
+        # user-assigned label (e.g. "Downloads"), not just the hardware name.
+        if not dev.volume_name:
+            label = wpd_labels.get(dev.serial_number.upper(), "")
+            if not label and dev.parent_id_prefix:
+                label = wpd_labels.get(dev.parent_id_prefix.upper(), "")
+            if label:
+                dev.volume_name = label
+
+        # ── Volume label: VolumeInfoCache (drive-letter-indexed) ──────────
+        # If we now have a drive letter, look up the label for that letter.
+        # This is the most accurate source (exactly what Explorer shows).
+        if not dev.volume_name and dev.drive_letter:
+            label = vol_cache.get(dev.drive_letter.rstrip("\\").upper(), "")
+            if label:
+                dev.volume_name = label
+
+        # ── Volume name & serial: EMDMgmt (hardware-name based) ──────────
+        # Used as a fallback when WPD and VolumeInfoCache both miss.
+        if (not dev.volume_serial or not dev.volume_name) and emdmgmt:
             candidate_ser, candidate_name = _match_emdmgmt(dev, emdmgmt)
             if candidate_ser:
-                dev.volume_serial = candidate_ser
-                dev.volume_name   = candidate_name
+                if not dev.volume_serial:
+                    dev.volume_serial = candidate_ser
+                if not dev.volume_name:
+                    dev.volume_name = candidate_name
 
         # ── User attribution ──────────────────────────────────────────────
         if dev.volume_guid:
@@ -1285,23 +1774,41 @@ class USBScanner:
 
         # ── 4. EMDMgmt (volume names / serials) ───────────────────────────
         self._status("Parsing EMDMgmt (volume info)…")
-        self._progress(52)
+        self._progress(48)
         emdmgmt: dict[str, EMDEntry] = {}
         try:
             emdmgmt = parse_emdmgmt(self._ctx)
         except Exception as exc:
             warn(f"EMDMgmt: {exc}")
 
-        # ── 5. MountedDevices (binary decode) ─────────────────────────────
+        # ── 5. Windows Portable Devices (user-assigned volume labels) ─────
+        self._status("Parsing Windows Portable Devices (volume labels)…")
+        self._progress(54)
+        wpd_labels: dict[str, str] = {}
+        try:
+            wpd_labels = parse_wpd_devices(self._ctx)
+        except Exception as exc:
+            warn(f"WPD devices: {exc}")
+
+        # ── 6. VolumeInfoCache (drive letter → volume label) ───────────────
+        self._status("Parsing VolumeInfoCache (volume labels)…")
+        self._progress(59)
+        vol_cache: dict[str, str] = {}
+        try:
+            vol_cache = parse_volume_info_cache(self._ctx)
+        except Exception as exc:
+            warn(f"VolumeInfoCache: {exc}")
+
+        # ── 7. MountedDevices (binary decode) ─────────────────────────────
         self._status("Decoding MountedDevices binary data…")
-        self._progress(63)
+        self._progress(65)
         mounted: dict[str, MountedEntry] = {}
         try:
             mounted = parse_mounted_devices(self._ctx)
         except Exception as exc:
             warn(f"MountedDevices: {exc}")
 
-        # ── 6. MountPoints2 (user attribution) ────────────────────────────
+        # ── 8. MountPoints2 (user attribution) ────────────────────────────
         self._status("Parsing MountPoints2 (user attribution)…")
         self._progress(74)
         user_vols: list[UserVolumeInfo] = []
@@ -1310,7 +1817,7 @@ class USBScanner:
         except Exception as exc:
             warn(f"MountPoints2: {exc}")
 
-        # ── 7. DeviceClasses (serial → volume GUID) ───────────────────────
+        # ── 9. DeviceClasses (serial → volume GUID) ───────────────────────
         self._status("Correlating DeviceClasses…")
         self._progress(83)
         serial_to_vol: dict[str, str] = {}
@@ -1319,15 +1826,16 @@ class USBScanner:
         except Exception as exc:
             warn(f"DeviceClasses: {exc}")
 
-        # ── 8. Cross-reference enrichment ────────────────────────────────
+        # ── 10. Cross-reference enrichment ────────────────────────────────
         self._status("Cross-referencing all sources…")
         self._progress(90)
         try:
-            enrich_devices(all_devices, emdmgmt, mounted, user_vols, serial_to_vol)
+            enrich_devices(all_devices, emdmgmt, mounted, user_vols,
+                           serial_to_vol, wpd_labels, vol_cache)
         except Exception as exc:
             warn(f"Enrichment: {exc}")
 
-        # ── 9. Deduplication ──────────────────────────────────────────────
+        # ── 11. Deduplication ─────────────────────────────────────────────
         self._status("Deduplicating…")
         self._progress(96)
         seen:   set[tuple] = set()
@@ -1342,6 +1850,40 @@ class USBScanner:
         self._status(f"Done — {len(unique)} unique device(s) found.")
         self._progress(100)
         return unique, warnings
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DIRTY HIVE DETECTION
+#
+#  Modern Windows does NOT flush registry changes directly to disk.  Instead
+#  it writes changes to transaction log files (SYSTEM.LOG1, SYSTEM.LOG2)
+#  and keeps the canonical hive file "dirty" (behind the live state).
+#
+#  If you extract a SYSTEM hive from a running machine with a tool like
+#  FTK Imager, the base SYSTEM file may be missing recent DEVPKEY timestamps
+#  that are only flushed to SYSTEM.LOG1 or RAM.
+#
+#  python-registry does NOT replay transaction logs.  To fix a dirty hive:
+#    1. Copy SYSTEM, SYSTEM.LOG1, and SYSTEM.LOG2 to a folder.
+#    2. Run Eric Zimmerman's rla.exe:
+#         rla.exe -d C:\Path\To\HiveFolder
+#    3. Load the resulting clean SYSTEM file into USB RegParse.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _detect_dirty_hive(hive_path: str) -> list[str]:
+    """
+    Check whether transaction log files exist alongside a hive file.
+
+    Returns a list of found log file paths (e.g. ["…/SYSTEM.LOG1"]).
+    An empty list means the hive appears clean (or logs were already merged).
+    """
+    found = []
+    base = Path(hive_path)
+    for suffix in (".LOG1", ".LOG2", ".log1", ".log2"):
+        candidate = base.parent / (base.name + suffix)
+        if candidate.exists():
+            found.append(str(candidate))
+    return found
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1913,6 +2455,27 @@ class USBRegParseApp(tk.Tk):
     def _scan(self):
         if self._scan_thread and self._scan_thread.is_alive():
             return
+
+        # ── Administrator check ──────────────────────────────────────────
+        # Live scan: timestamps in USBSTOR Properties subkeys are protected
+        # by a SYSTEM-only ACL and require Administrator + SeBackupPrivilege.
+        # Offline scan: no admin required (python-registry reads files),
+        # but we still warn because the user may later try a live scan.
+        if sys.platform == "win32" and not _is_admin():
+            messagebox.showwarning(
+                "Administrator Privileges Required",
+                "USB RegParse is not running as Administrator.\n\n"
+                "Without Administrator privileges:\n"
+                "  • First Connected timestamps will be blank\n"
+                "  • Last Disconnected timestamps will be blank\n"
+                "  • Some registry keys may return 'Access Denied'\n\n"
+                "To get complete results:\n"
+                "  1. Close this window\n"
+                "  2. Right-click usb_regparse.py → Run as Administrator\n"
+                "     (or launch your terminal/IDE as Administrator first)\n\n"
+                "You may continue, but timestamp fields will be incomplete.",
+                parent=self)
+
         if self._mode_var.get() == "offline":
             self._scan_offline()
         else:
@@ -1923,6 +2486,17 @@ class USBRegParseApp(tk.Tk):
         self._pre_scan()
         def _run():
             try:
+                # Enable SeBackupPrivilege so we can read SYSTEM-only keys
+                # such as USBSTOR\...\Properties\{GUID}\0064 timestamp subkeys.
+                # This is a no-op if already enabled or if the process is not
+                # running as Administrator.
+                priv_ok = enable_backup_privilege()
+                if not priv_ok:
+                    # Not fatal — timestamps will be blank but other data
+                    # will still be collected.  Surface a soft warning.
+                    self.after(0, lambda: self._set_status(
+                        "⚠  Run as Administrator for full timestamp access.", "warn"))
+
                 ctx = RegistryContext(live=True)
                 scanner = USBScanner(ctx,
                     progress_cb=lambda v: self.after(0, lambda: self._prog_var.set(v)),
@@ -1953,6 +2527,34 @@ class USBRegParseApp(tk.Tk):
             messagebox.showerror("File Not Found",
                 f"SYSTEM hive not found:\n{sys_path}", parent=self)
             return
+
+        # ── Dirty-hive detection ─────────────────────────────────────────
+        # If transaction log files (SYSTEM.LOG1 / SYSTEM.LOG2) exist in the
+        # same folder as the SYSTEM hive, the base file is "dirty" — recent
+        # registry writes (including DEVPKEY timestamps) may only exist in
+        # the log files, not in the base hive.  python-registry does NOT
+        # replay transaction logs, so those timestamps would appear blank.
+        log_files = _detect_dirty_hive(sys_path)
+        if log_files:
+            log_names = "\n  ".join(Path(p).name for p in log_files)
+            proceed = messagebox.askyesno(
+                "⚠  Dirty Hive Detected — Timestamps May Be Incomplete",
+                f"Transaction log file(s) were found alongside your SYSTEM hive:\n\n"
+                f"  {log_names}\n\n"
+                f"This means the hive is 'dirty' — recent USB timestamps (First\n"
+                f"Connected, Last Disconnected) may only exist in these log files,\n"
+                f"not in the base SYSTEM file.  python-registry cannot replay logs,\n"
+                f"so those fields may show as blank.\n\n"
+                f"To fix this before scanning:\n"
+                f"  1. Copy SYSTEM, SYSTEM.LOG1, SYSTEM.LOG2 into one folder.\n"
+                f"  2. Run: rla.exe -d <that folder>\n"
+                f"     (Free download: ericzimmerman.github.io)\n"
+                f"  3. Load the merged SYSTEM file output by rla.exe.\n\n"
+                f"Continue anyway with the dirty hive?",
+                icon="warning",
+                parent=self)
+            if not proceed:
+                return
 
         self._pre_scan()
         def _run():
